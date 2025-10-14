@@ -571,6 +571,50 @@ def buscar_agregados_por_termo(termo: str, limite: int = 10) -> Dict[str, Any]:
     except Exception as e:
         return {"status": "erro", "mensagem": str(e)}
 
+
+@mcp.tool()
+def buscar_localidades_por_nome(agregado_id: int, nivel: str, nome_localidade: str) -> Dict[str, Any]:
+    """
+    Busca localidades por nome dentro de um agregado e nível geográfico, tratando ambiguidades.
+
+    Args:
+        agregado_id: ID do agregado para pesquisar as localidades.
+        nivel: Nível geográfico (ex: "N6" para municípios).
+        nome_localidade: Nome da localidade a ser buscada.
+
+    Returns:
+        Dicionário com a lista de localidades correspondentes.
+    """
+    try:
+        todas_localidades = ibge_client.get_localidades(agregado_id, nivel)
+        
+        def normalizar(texto: str) -> str:
+            return ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn').lower()
+
+        nome_normalizado = normalizar(nome_localidade)
+        
+        correspondencias = [
+            loc for loc in todas_localidades 
+            if nome_normalizado in normalizar(loc.get("nome", ""))
+        ]
+        
+        if not correspondencias:
+            return {
+                "status": "sucesso",
+                "total_encontrados": 0,
+                "mensagem": f"Nenhuma localidade encontrada com o nome '{nome_localidade}' no nível '{nivel}'.",
+                "resultados": []
+            }
+            
+        return {
+            "status": "sucesso",
+            "total_encontrados": len(correspondencias),
+            "resultados": correspondencias
+        }
+    except Exception as e:
+        return {"status": "erro", "mensagem": str(e)}
+
+
 @mcp.resource("mcp://ibge/help")
 def help_documentation() -> str:
     """Documentação de ajuda para usar o servidor MCP do IBGE"""
@@ -604,15 +648,22 @@ Este servidor MCP fornece acesso simplificado aos dados estatísticos do IBGE.
 - Busca agregados por termo no nome
 - Parâmetros: termo, limite
 
+### 7. buscar_localidades_por_nome
+- Busca IDs de localidades por nome, tratando ambiguidades.
+- Parâmetros: agregado_id, nivel, nome_localidade
+
 ## Exemplos de Uso:
 
-1. Buscar dados de população:
+1. Buscar agregados sobre "população":
    `buscar_agregados_por_termo("população")`
 
-2. Obter metadados do agregado 1705:
+2. Encontrar o ID do município "Pará de Minas" (MG) usando o agregado da contagem da população (ex: 9923):
+   `buscar_localidades_por_nome(agregado_id=9923, nivel='N6', nome_localidade='Pará de Minas')`
+
+3. Obter metadados do agregado 1705:
    `obter_metadados_agregado(1705)`
 
-3. Consultar dados do PIB para o Brasil nos últimos 6 períodos:
+4. Consultar dados do PIB para o Brasil nos últimos 6 períodos:
    `consultar_dados_variaveis(1705, "all", "BR", "-6")`
 
 ## Níveis Geográficos:
