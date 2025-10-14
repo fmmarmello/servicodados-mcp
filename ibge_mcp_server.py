@@ -14,8 +14,12 @@ Versão: 1.0 (VERSÃO DEFINITIVA)
 import asyncio
 import json
 import logging
+import os
+import time
+import unicodedata
 import requests
-from typing import Dict, List, Any, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 try:
@@ -43,6 +47,8 @@ class IBGEAPIClient:
             'User-Agent': 'MCP-IBGE-Server/1.0',
             'Accept': 'application/json'
         })
+        self._metadata_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_stats = {"hits": 0, "misses": 0}
     
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Faz requisição para a API do IBGE"""
@@ -65,6 +71,12 @@ class IBGEAPIClient:
     
     def get_agregado_metadados(self, agregado_id: int) -> Dict[str, Any]:
         """Obtém metadados de um agregado específico"""
+        cache_key = str(agregado_id)
+        if cache_key in self._metadata_cache:
+            self._cache_stats["hits"] += 1
+            return self._metadata_cache[cache_key]
+
+        self._cache_stats["misses"] += 1
         data = self._make_request(f"/agregados/{agregado_id}/metadados")
         # A API do IBGE às vezes responde com uma lista contendo um único item;
         # normalizamos para sempre trabalhar com um dicionário.
@@ -76,6 +88,7 @@ class IBGEAPIClient:
             raise Exception(
                 f"Formato inesperado de metadados ({type(data).__name__}) para agregado {agregado_id}"
             )
+        self._metadata_cache[cache_key] = data
         return data
     
     def get_localidades(self, agregado_id: int, nivel: str) -> List[Dict[str, Any]]:
@@ -106,9 +119,231 @@ class IBGEAPIClient:
             
         return self._make_request(endpoint, params=params)
 
-# Inicializar servidor MCP
+class AgregadoSearchIndex:
+    """Índice local para agilizar buscas por agregados usando termos enriquecidos."""
+
+    def __init__(
+        self,
+        client: IBGEAPIClient,
+        cache_filename: Optional[str] = None,
+        max_metadata_per_search: int = 25,
+    ):
+        self.client = client
+        self.max_metadata_per_search = max_metadata_per_search
+        self.cache_path = (
+            Path(cache_filename)
+            if cache_filename
+            else Path(__file__).with_name("ibge_agregado_index_cache.json")
+        )
+        self.index: Dict[str, Dict[str, Any]] = {}
+        self._loaded = False
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        if not value:
+            return ""
+        normalized = unicodedata.normalize("NFKD", value)
+        ascii_text = normalized.encode("ASCII", "ignore").decode("ASCII")
+        return ascii_text.lower().strip()
+
+    def _ensure_entry(self, agregado_id: str) -> Dict[str, Any]:
+        if agregado_id not in self.index:
+            self.index[agregado_id] = {
+                "terms": set(),
+                "metadata_loaded": False,
+                "last_updated": time.time(),
+            }
+        return self.index[agregado_id]
+
+    def _add_term(self, entry: Dict[str, Any], text: str) -> bool:
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return False
+        terms: Set[str] = entry["terms"]
+        if normalized in terms:
+            return False
+        terms.add(normalized)
+        entry["last_updated"] = time.time()
+        return True
+
+    def ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        if self.cache_path.exists():
+            try:
+                with self.cache_path.open("r", encoding="utf-8") as cache_file:
+                    payload = json.load(cache_file)
+                for agg_id, entry in payload.get("index", {}).items():
+                    terms = set(entry.get("terms", []))
+                    self.index[agg_id] = {
+                        "terms": terms,
+                        "metadata_loaded": entry.get("metadata_loaded", False),
+                        "last_updated": entry.get("last_updated", time.time()),
+                    }
+                logger.info(
+                    "Índice de agregados carregado do disco (%s entradas)", len(self.index)
+                )
+            except Exception as exc:
+                logger.warning("Falha ao carregar índice local: %s", exc)
+        self._loaded = True
+
+    def save(self) -> None:
+        try:
+            serializable_index = {
+                agg_id: {
+                    "terms": sorted(entry["terms"]),
+                    "metadata_loaded": entry.get("metadata_loaded", False),
+                    "last_updated": entry.get("last_updated", time.time()),
+                }
+                for agg_id, entry in self.index.items()
+            }
+            with self.cache_path.open("w", encoding="utf-8") as cache_file:
+                json.dump({"index": serializable_index}, cache_file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("Não foi possível salvar o índice local: %s", exc)
+
+    def build_basic_index(self, pesquisas: List[Dict[str, Any]]) -> bool:
+        self.ensure_loaded()
+        changed = False
+        for pesquisa in pesquisas:
+            pesquisa_nome = pesquisa.get("nome", "")
+            for agregado in pesquisa.get("agregados", []):
+                agregado_id = str(agregado.get("id"))
+                entry = self._ensure_entry(agregado_id)
+                if self._add_term(entry, pesquisa_nome):
+                    changed = True
+                if self._add_term(entry, agregado.get("nome", "")):
+                    changed = True
+                if self._add_term(entry, agregado.get("descricao", "")):
+                    changed = True
+        return changed
+
+    def enrich_with_metadados(self, agregado_id: str) -> bool:
+        entry = self._ensure_entry(agregado_id)
+        if entry.get("metadata_loaded"):
+            return False
+
+        metadata = self.client.get_agregado_metadados(int(agregado_id))
+        changed = False
+        for field in ("nome", "pesquisa", "assunto"):
+            if self._add_term(entry, metadata.get(field, "")):
+                changed = True
+        periodicidade = metadata.get("periodicidade", {})
+        for periodo_field in ("frequencia",):
+            if self._add_term(entry, periodicidade.get(periodo_field, "")):
+                changed = True
+
+        for variavel in metadata.get("variaveis", []):
+            if self._add_term(entry, variavel.get("nome", "")):
+                changed = True
+
+        for classificacao in metadata.get("classificacoes", []):
+            if self._add_term(entry, classificacao.get("nome", "")):
+                changed = True
+            for categoria in classificacao.get("categorias", []):
+                if self._add_term(entry, categoria.get("nome", "")):
+                    changed = True
+
+        entry["metadata_loaded"] = True
+        entry["last_updated"] = time.time()
+        return True
+
+    def _term_matches(self, entry: Dict[str, Any], normalized_term: str) -> bool:
+        if not normalized_term:
+            return False
+        return any(normalized_term in term for term in entry.get("terms", set()))
+
+    def pending_metadata_count(self) -> int:
+        return sum(1 for entry in self.index.values() if not entry.get("metadata_loaded"))
+
+    def search(
+        self,
+        termo: str,
+        pesquisas: List[Dict[str, Any]],
+        limite: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        self.ensure_loaded()
+        dirty = self.build_basic_index(pesquisas)
+
+        normalized_term = self._normalize_text(termo)
+        matches: List[Tuple[int, int, Dict[str, Any]]] = []
+        metadata_fetches = 0
+        metadata_errors = 0
+        ordem = 0
+
+        for pesquisa in pesquisas:
+            pesquisa_nome = pesquisa.get("nome", "")
+            for agregado in pesquisa.get("agregados", []):
+                agregado_id = str(agregado.get("id"))
+                entry = self._ensure_entry(agregado_id)
+
+                if self._term_matches(entry, normalized_term):
+                    score = 0 if entry.get("metadata_loaded") else 1
+                    matches.append(
+                        (
+                            score,
+                            ordem,
+                            {
+                                "agregado_id": agregado.get("id"),
+                                "agregado_nome": agregado.get("nome", ""),
+                                "pesquisa": pesquisa_nome,
+                                "pesquisa_id": pesquisa.get("id"),
+                            },
+                        )
+                    )
+                    ordem += 1
+                    continue
+
+                if (
+                    normalized_term
+                    and not entry.get("metadata_loaded")
+                    and metadata_fetches < self.max_metadata_per_search
+                ):
+                    try:
+                        if self.enrich_with_metadados(agregado_id):
+                            dirty = True
+                        metadata_fetches += 1
+                    except Exception as exc:
+                        metadata_errors += 1
+                        logger.warning(
+                            "Falha ao enriquecer índice para agregado %s: %s",
+                            agregado_id,
+                            exc,
+                        )
+                    else:
+                        entry = self._ensure_entry(agregado_id)
+                        if self._term_matches(entry, normalized_term):
+                            matches.append(
+                                (
+                                    0,
+                                    ordem,
+                                    {
+                                        "agregado_id": agregado.get("id"),
+                                        "agregado_nome": agregado.get("nome", ""),
+                                        "pesquisa": pesquisa_nome,
+                                        "pesquisa_id": pesquisa.get("id"),
+                                    },
+                                )
+                            )
+                            ordem += 1
+
+        if dirty:
+            self.save()
+
+        matches.sort(key=lambda item: (item[0], item[1]))
+        resultados = [item[2] for item in matches[:limite]]
+
+        stats = {
+            "metadata_fetches": metadata_fetches,
+            "metadata_errors": metadata_errors,
+            "pendencias_indice": self.pending_metadata_count(),
+        }
+        return resultados, stats
+
+# Inicializar servidor MCP e infraestrutura auxiliar
 mcp = FastMCP(name="IBGE-Data-Server")
 ibge_client = IBGEAPIClient()
+search_index = AgregadoSearchIndex(ibge_client)
 
 @mcp.tool()
 def listar_agregados(periodo: Optional[str] = None, 
@@ -298,39 +533,40 @@ def buscar_agregados_por_termo(termo: str, limite: int = 10) -> Dict[str, Any]:
         Lista de agregados encontrados
     """
     try:
-        # Obter todos os agregados
+        if limite <= 0:
+            limite = 10
+
         todos_agregados = ibge_client.get_agregados()
-        
-        # Buscar termo nos nomes e pesquisas
-        termo_lower = termo.lower()
-        agregados_encontrados = []
-        
-        for pesquisa in todos_agregados:
-            pesquisa_nome = pesquisa.get("nome", "").lower()
-            
-            for agregado in pesquisa.get("agregados", []):
-                agregado_nome = agregado.get("nome", "").lower()
-                
-                if termo_lower in pesquisa_nome or termo_lower in agregado_nome:
-                    agregados_encontrados.append({
-                        "agregado_id": agregado.get("id"),
-                        "agregado_nome": agregado.get("nome", ""),
-                        "pesquisa": pesquisa.get("nome", ""),
-                        "pesquisa_id": pesquisa.get("id")
-                    })
-                    
-                if len(agregados_encontrados) >= limite:
-                    break
-                    
-            if len(agregados_encontrados) >= limite:
-                break
-        
+        resultados, stats = search_index.search(termo, todos_agregados, limite)
+
+        nota_partes: List[str] = []
+        if stats.get("metadata_fetches"):
+            nota_partes.append(
+                f"Metadados adicionais carregados para {stats['metadata_fetches']} agregado(s) durante esta busca."
+            )
+        if (
+            stats.get("pendencias_indice")
+            and stats.get("metadata_fetches", 0) >= search_index.max_metadata_per_search
+        ):
+            nota_partes.append(
+                "O índice ainda está sendo enriquecido; refaça a busca ou refine o termo para melhorar os resultados."
+            )
+        if stats.get("metadata_errors"):
+            nota_partes.append(
+                f"Ocorreram {stats['metadata_errors']} erro(s) ao carregar metadados; consulte os logs para detalhes."
+            )
+
         return {
             "status": "sucesso",
             "termo_buscado": termo,
-            "total_encontrados": len(agregados_encontrados),
+            "total_encontrados": len(resultados),
             "limite_aplicado": limite,
-            "resultados": agregados_encontrados
+            "resultados": resultados,
+            "indice": {
+                "pendencias_metadados": stats.get("pendencias_indice", 0),
+                "metadata_carregados": stats.get("metadata_fetches", 0),
+            },
+            "nota": " ".join(nota_partes) if nota_partes else None
         }
     except Exception as e:
         return {"status": "erro", "mensagem": str(e)}
