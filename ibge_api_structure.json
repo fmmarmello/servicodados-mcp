@@ -1,0 +1,59 @@
+{
+  "base_url": "https://servicodados.ibge.gov.br/api/v3",
+  "endpoints": {
+    "agregados": {
+      "path": "/agregados",
+      "description": "Obtém o conjunto de agregados, agrupados pelas respectivas pesquisas",
+      "parameters": {
+        "periodo": "Obtém as pesquisas cujos agregados disponibilizam resultados para o período informado",
+        "assunto": "Obtém as pesquisas cujos agregados contém o assunto informado",
+        "classificacao": "Obtém as pesquisas cujos agregados contém a classificação informada",
+        "periodicidade": "Obtém as pesquisas cujos agregados contém a periodicidade de divulgação informada",
+        "nivel": "Obtém as pesquisas cujos agregados disponibilizam resultados para o nível geográfico informado"
+      }
+    },
+    "localidades": {
+      "path": "/agregados/{agregado}/localidades/{nivel}",
+      "description": "Obtém as localidades associadas ao agregado de acordo com um ou mais níveis geográficos"
+    },
+    "metadados": {
+      "path": "/agregados/{agregado}/metadados",
+      "description": "Obtém os metadados associados ao agregado"
+    },
+    "periodos": {
+      "path": "/agregados/{agregado}/periodos",
+      "description": "Obtém os períodos associados ao agregado"
+    },
+    "variaveis_com_periodo": {
+      "path": "/agregados/{agregado}/periodos/{periodos}/variaveis/{variavel}",
+      "description": "Obtém o conjunto de variáveis a partir do identificador do agregado, períodos pesquisados e identificador das variáveis"
+    },
+    "variaveis": {
+      "path": "/agregados/{agregado}/variaveis/{variavel}",
+      "description": "Funcionalmente equivalente à /agregados/{agregado}/periodos/-6/variaveis/{variavel}"
+    }
+  },
+  "common_parameters": {
+    "localidades": "Uma ou mais localidades delimitadas pelo caracter | (pipe). No caso do Brasil, o identificador é BR",
+    "classificacao": "Restringe consulta usando classificações e categorias específicas",
+    "view": "Modo de visualização. Pode ser OLAP ou flat"
+  },
+  "data_limits": {
+    "max_values": 100000,
+    "formula": "Nº de categorias x Nº de períodos x Nº de localidades <= 100.000"
+  },
+  "special_values": {
+    "-": "Dado numérico igual a zero não resultante de arredondamento",
+    "..": "Não se aplica dado numérico",
+    "...": "Dado numérico não disponível",
+    "X": "Dado numérico omitido a fim de evitar a individualização da informação"
+  },
+  "geographic_levels": {
+    "BR": "Brasil",
+    "N1": "Grandes Regiões",
+    "N2": "Unidades da Federação",
+    "N3": "Mesorregiões",
+    "N6": "Municípios",
+    "N7": "Regiões Metropolitanas"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ibge-data": {
+      "command": "python",
+      "args": [
+        "ibge_mcp_server.py"
+      ],
+      "env": {},
+      "description": "Servidor MCP para acesso aos dados do IBGE"
+    }
+  }
+}
